@@ -39,12 +39,17 @@ app.post('/auth/signup', async (req, res) => {
 
   if (error) return res.status(400).json({ error: error.message });
 
-  // Profile save karo
-  await supabase.from('profiles').insert({
+  // Profile save karo (upsert — agar pehle se hai toh update karo)
+  const { error: profileError } = await supabase.from('profiles').upsert({
     id: data.user.id,
     full_name,
     phone: phone || ''
-  });
+  }, { onConflict: 'id' });
+
+  if (profileError) {
+    console.error('Profile insert error:', profileError.message);
+    // User ban gaya hai, profile error ignore karo — aage badho
+  }
 
   res.json({ message: 'Account ban gaya!', user_id: data.user.id });
 });
