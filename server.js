@@ -90,6 +90,74 @@ async function authMiddleware(req, res, next) {
 }
 
 // ─────────────────────────────────────────
+// AUTH — GET PROFILE (full_name + photo)
+// ─────────────────────────────────────────
+app.get('/auth/me', authMiddleware, async (req, res) => {
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('full_name, phone, photo_url')
+    .eq('id', req.user.id)
+    .single();
+
+  if (error) return res.status(404).json({ error: 'Profile nahi mila' });
+
+  res.json({
+    id: req.user.id,
+    email: req.user.email,
+    full_name: data.full_name || '',
+    phone: data.phone || '',
+    photo_url: data.photo_url || null
+  });
+});
+
+// ─────────────────────────────────────────
+// AUTH — PROFILE PHOTO UPDATE (Supabase Storage)
+// ─────────────────────────────────────────
+app.post('/auth/update-photo', authMiddleware, async (req, res) => {
+  const { photo_base64 } = req.body;
+
+  if (!photo_base64) return res.status(400).json({ error: 'Photo data nahi mila' });
+
+  try {
+    // Base64 se Buffer banao
+    const base64Data = photo_base64.replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
+
+    // Extension detect karo
+    const match = photo_base64.match(/^data:image\/(\w+);base64,/);
+    const ext = match ? match[1] : 'jpg';
+    const fileName = `avatars/${req.user.id}.${ext}`;
+
+    // Supabase Storage mein upload karo (bucket: 'profiles')
+    const { error: uploadError } = await supabase.storage
+      .from('profiles')
+      .upload(fileName, buffer, {
+        contentType: `image/${ext}`,
+        upsert: true  // Purani photo replace ho jayegi
+      });
+
+    if (uploadError) return res.status(500).json({ error: uploadError.message });
+
+    // Public URL lo
+    const { data: urlData } = supabase.storage
+      .from('profiles')
+      .getPublicUrl(fileName);
+
+    const photo_url = urlData.publicUrl;
+
+    // Profiles table mein save karo
+    await supabase
+      .from('profiles')
+      .update({ photo_url })
+      .eq('id', req.user.id);
+
+    res.json({ message: 'Photo update ho gayi!', photo_url });
+  } catch (e) {
+    res.status(500).json({ error: 'Photo upload failed: ' + e.message });
+  }
+});
+
+// ─────────────────────────────────────────
 // PRODUCTS — SABHI PRODUCTS
 // ─────────────────────────────────────────
 app.get('/products', async (req, res) => {
