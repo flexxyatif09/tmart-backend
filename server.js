@@ -3,6 +3,17 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
+// ─────────────────────────────────────────
+// FIREBASE ADMIN INIT (FCM ke liye)
+// ─────────────────────────────────────────
+const admin = require('firebase-admin');
+if (!admin.apps.length) {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
@@ -14,11 +25,14 @@ const supabase = createClient(
   process.env.SUPABASE_SECRET_KEY
 );
 
+// FCM Tokens in-memory store
+const fcmTokens = [];
+
 // ─────────────────────────────────────────
 // TEST ROUTE
 // ─────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ message: 'Tmart Backend Chal Raha Hai ✅' });
+  res.json({ message: 'JNGMart Backend Chal Raha Hai ✅' });
 });
 
 // ─────────────────────────────────────────
@@ -39,7 +53,6 @@ app.post('/auth/signup', async (req, res) => {
 
   if (error) return res.status(400).json({ error: error.message });
 
-  // Profile save karo (upsert — agar pehle se hai toh update karo)
   const { error: profileError } = await supabase.from('profiles').upsert({
     id: data.user.id,
     full_name,
@@ -48,7 +61,6 @@ app.post('/auth/signup', async (req, res) => {
 
   if (profileError) {
     console.error('Profile insert error:', profileError.message);
-    // User ban gaya hai, profile error ignore karo — aage badho
   }
 
   res.json({ message: 'Account ban gaya!', user_id: data.user.id });
@@ -96,7 +108,7 @@ async function authMiddleware(req, res, next) {
 }
 
 // ─────────────────────────────────────────
-// AUTH — GET PROFILE (full_name + photo)
+// AUTH — GET PROFILE
 // ─────────────────────────────────────────
 app.get('/auth/me', authMiddleware, async (req, res) => {
   const { data, error } = await supabase
@@ -117,7 +129,7 @@ app.get('/auth/me', authMiddleware, async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// AUTH — PROFILE PHOTO UPDATE (Supabase Storage)
+// AUTH — PROFILE PHOTO UPDATE
 // ─────────────────────────────────────────
 app.post('/auth/update-photo', authMiddleware, async (req, res) => {
   const { photo_base64 } = req.body;
@@ -125,40 +137,34 @@ app.post('/auth/update-photo', authMiddleware, async (req, res) => {
   if (!photo_base64) return res.status(400).json({ error: 'Photo data nahi mila' });
 
   try {
-    // Base64 se Buffer banao
     const base64Data = photo_base64.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
 
-    // Extension detect karo
     const match = photo_base64.match(/^data:image\/(\w+);base64,/);
     const ext = match ? match[1] : 'jpg';
     const fileName = `avatars/${req.user.id}.${ext}`;
 
-    // Supabase Storage mein upload karo (bucket: 'profiles')
     const { error: uploadError } = await supabase.storage
       .from('profiles')
       .upload(fileName, buffer, {
         contentType: `image/${ext}`,
-        upsert: true  // Purani photo replace ho jayegi
+        upsert: true
       });
 
     if (uploadError) return res.status(500).json({ error: uploadError.message });
 
-    // Public URL lo
     const { data: urlData } = supabase.storage
       .from('profiles')
       .getPublicUrl(fileName);
 
     const photo_url = urlData.publicUrl;
 
-    // Profiles table mein save karo
     const { error: updateError } = await supabase
       .from('profiles')
       .update({ photo_url })
       .eq('id', req.user.id);
 
     if (updateError) {
-      console.error('Profile update error:', updateError.message);
       return res.status(500).json({ error: 'DB update failed: ' + updateError.message });
     }
 
@@ -221,14 +227,10 @@ app.post('/orders/place', authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'Cart khali hai' });
   }
 
-  // 10% advance calculate karo
   const advance = parseFloat((total_amount * 0.10).toFixed(2));
   const remaining = parseFloat((total_amount - advance).toFixed(2));
-
-  // 6 digit OTP generate karo
   const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-  // Order banao
   const { data: order, error: orderError } = await supabase
     .from('orders')
     .insert({
@@ -245,7 +247,6 @@ app.post('/orders/place', authMiddleware, async (req, res) => {
 
   if (orderError) return res.status(500).json({ error: orderError.message });
 
-  // Order items save karo
   const orderItems = items.map(item => ({
     order_id: order.id,
     product_id: item.product_id,
@@ -255,12 +256,30 @@ app.post('/orders/place', authMiddleware, async (req, res) => {
 
   await supabase.from('order_items').insert(orderItems);
 
+  // ── Order place hone pe user ko notification bhejo ──
+  try {
+    const userTokens = fcmTokens.filter(t => t.userId === req.user.id);
+    if (userTokens.length > 0) {
+      await admin.messaging().sendEachForMulticast({
+        notification: {
+          title: '🛒 Order Place Ho Gaya!',
+          body: `Order #${order.id.slice(0,6).toUpperCase()} confirm hai. Ab advance pay karo.`,
+        },
+        data: { type: 'order' },
+        android: { notification: { sound: 'default', channelId: 'jngmart_channel' } },
+        tokens: userTokens.map(t => t.token),
+      });
+    }
+  } catch (fcmErr) {
+    console.error('Order notification error:', fcmErr.message);
+  }
+
   res.json({
     message: 'Order ban gaya! Ab advance pay karo.',
     order_id: order.id,
     advance_amount: advance,
     remaining_amount: remaining,
-    otp_code: otp  // Real app mein yeh mat bhejo — admin ko dikhao
+    otp_code: otp
   });
 });
 
@@ -270,7 +289,6 @@ app.post('/orders/place', authMiddleware, async (req, res) => {
 app.post('/orders/verify-otp', authMiddleware, async (req, res) => {
   const { order_id, otp_entered } = req.body;
 
-  // DB se order lo
   const { data: order, error } = await supabase
     .from('orders')
     .select('otp_code, otp_verified, user_id')
@@ -279,7 +297,6 @@ app.post('/orders/verify-otp', authMiddleware, async (req, res) => {
 
   if (error || !order) return res.status(404).json({ error: 'Order nahi mila' });
 
-  // Sirf apna order verify kare
   if (order.user_id !== req.user.id) {
     return res.status(403).json({ error: 'Yeh tumhara order nahi hai' });
   }
@@ -292,7 +309,6 @@ app.post('/orders/verify-otp', authMiddleware, async (req, res) => {
     return res.status(400).json({ error: 'Galat OTP! Dobara try karo.' });
   }
 
-  // OTP sahi — order confirm karo
   await supabase
     .from('orders')
     .update({
@@ -301,6 +317,24 @@ app.post('/orders/verify-otp', authMiddleware, async (req, res) => {
       order_status: 'confirmed'
     })
     .eq('id', order_id);
+
+  // ── OTP verify hone pe delivery notification ──
+  try {
+    const userTokens = fcmTokens.filter(t => t.userId === req.user.id);
+    if (userTokens.length > 0) {
+      await admin.messaging().sendEachForMulticast({
+        notification: {
+          title: '✅ Order Confirmed!',
+          body: 'Payment confirm ho gayi. Aapka order taiyar ho raha hai!',
+        },
+        data: { type: 'order' },
+        android: { notification: { sound: 'default', channelId: 'jngmart_channel' } },
+        tokens: userTokens.map(t => t.token),
+      });
+    }
+  } catch (fcmErr) {
+    console.error('OTP notification error:', fcmErr.message);
+  }
 
   res.json({ message: '🎉 Order Confirm Ho Gaya!' });
 });
@@ -388,7 +422,6 @@ app.post('/addresses', authMiddleware, async (req, res) => {
 app.post('/wishlist/toggle', authMiddleware, async (req, res) => {
   const { product_id } = req.body;
 
-  // Check karo already hai ya nahi
   const { data: existing } = await supabase
     .from('wishlist')
     .select('id')
@@ -397,11 +430,9 @@ app.post('/wishlist/toggle', authMiddleware, async (req, res) => {
     .single();
 
   if (existing) {
-    // Remove karo
     await supabase.from('wishlist').delete().eq('id', existing.id);
     return res.json({ message: 'Wishlist se hata diya', wishlisted: false });
   } else {
-    // Add karo
     await supabase.from('wishlist').insert({
       user_id: req.user.id,
       product_id
@@ -410,10 +441,144 @@ app.post('/wishlist/toggle', authMiddleware, async (req, res) => {
   }
 });
 
+// ═════════════════════════════════════════
+// FCM — DEVICE TOKEN SAVE KARO
+// App se aayega — user ke device ka token
+// POST /api/fcm-token
+// Body: { token, userId }
+// ═════════════════════════════════════════
+app.post('/api/fcm-token', async (req, res) => {
+  try {
+    const { token, userId } = req.body;
+    if (!token) return res.status(400).json({ error: 'Token required hai' });
+
+    const exists = fcmTokens.find(t => t.token === token);
+    if (!exists) {
+      fcmTokens.push({ token, userId: userId || 'guest', createdAt: Date.now() });
+      console.log(`FCM Token saved. Total devices: ${fcmTokens.length}`);
+    }
+
+    res.json({ success: true, message: 'Token save ho gaya' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════
+// FCM — SABKO NOTIFICATION BHEJO
+// Admin panel se call hoga
+// POST /api/send-notification
+// Body: { title, body, type, imageUrl }
+// ═════════════════════════════════════════
+app.post('/api/send-notification', async (req, res) => {
+  // Admin key check
+  const adminKey = req.headers['x-admin-key'];
+  if (adminKey !== process.env.ADMIN_KEY) {
+    return res.status(403).json({ error: 'Admin access nahi hai' });
+  }
+
+  try {
+    const { title, body, type = 'general', imageUrl, targetUserId } = req.body;
+
+    if (!title || !body) {
+      return res.status(400).json({ error: 'Title aur body required hai' });
+    }
+
+    let targets = fcmTokens;
+    if (targetUserId) {
+      targets = fcmTokens.filter(t => t.userId === targetUserId);
+    }
+
+    if (targets.length === 0) {
+      return res.json({ success: true, sent: 0, message: 'Koi registered device nahi' });
+    }
+
+    const tokenList = targets.map(t => t.token);
+
+    const message = {
+      notification: {
+        title,
+        body,
+        ...(imageUrl && { imageUrl }),
+      },
+      data: { type },
+      android: {
+        notification: {
+          sound: 'default',
+          priority: 'high',
+          channelId: 'jngmart_channel',
+        },
+      },
+      tokens: tokenList,
+    };
+
+    const response = await admin.messaging().sendEachForMulticast(message);
+
+    // Failed tokens hata do
+    response.responses.forEach((resp, idx) => {
+      if (!resp.success) {
+        const failedToken = tokenList[idx];
+        const i = fcmTokens.findIndex(t => t.token === failedToken);
+        if (i !== -1) fcmTokens.splice(i, 1);
+      }
+    });
+
+    res.json({
+      success: true,
+      sent: response.successCount,
+      failed: response.failureCount,
+      total: tokenList.length,
+    });
+
+  } catch (err) {
+    console.error('FCM Send Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════
+// FCM — TOPIC NOTIFICATION (sabko ek saath)
+// POST /api/send-topic-notification
+// Body: { title, body, topic }
+// ═════════════════════════════════════════
+app.post('/api/send-topic-notification', async (req, res) => {
+  const adminKey = req.headers['x-admin-key'];
+  if (adminKey !== process.env.ADMIN_KEY) {
+    return res.status(403).json({ error: 'Admin access nahi hai' });
+  }
+
+  try {
+    const { title, body, topic = 'all_users', imageUrl } = req.body;
+
+    const message = {
+      notification: { title, body, ...(imageUrl && { imageUrl }) },
+      data: { type: 'broadcast' },
+      android: {
+        notification: { sound: 'default', priority: 'high', channelId: 'jngmart_channel' },
+      },
+      topic,
+    };
+
+    const response = await admin.messaging().send(message);
+    res.json({ success: true, messageId: response });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════
+// FCM — REGISTERED DEVICES COUNT
+// GET /api/fcm-tokens
+// ═════════════════════════════════════════
+app.get('/api/fcm-tokens', async (req, res) => {
+  res.json({ count: fcmTokens.length });
+});
+
 // ─────────────────────────────────────────
 // SERVER START
 // ─────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Tmart Backend Port ${PORT} pe chal raha hai ✅`);
+  console.log(`JNGMart Backend Port ${PORT} pe chal raha hai ✅`);
 });
